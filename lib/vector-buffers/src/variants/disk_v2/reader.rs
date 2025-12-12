@@ -1077,6 +1077,32 @@ where
                     continue;
                 }
 
+                // Before waiting for the writer, check if there are pending acknowledgements.
+                // This is crucial for batched sinks: if the sink is waiting to complete a batch
+                // before acknowledging, and we're waiting for more data that won't come, we'd
+                // deadlock. Processing acknowledgements may free up buffer space and allow
+                // the batch timeout to fire.
+                let total_buffer_size = self.ledger.get_total_buffer_size();
+                if total_buffer_size > 0 {
+                    // There are unacknowledged events. Use a timeout when waiting for the writer
+                    // to avoid blocking forever. This allows the sink's batch timeout to fire.
+                    use tokio::time::{Duration, timeout};
+                    let wait_result = timeout(
+                        Duration::from_secs(1),
+                        self.ledger.wait_for_writer()
+                    ).await;
+
+                    if wait_result.is_err() {
+                        // Timeout - no new data from writer. Process any pending acks
+                        // and continue the loop. This gives batched sinks a chance to
+                        // flush incomplete batches via their timeout mechanism.
+                        self.handle_pending_acknowledgements(false)
+                            .await
+                            .context(IoSnafu)?;
+                    }
+                    continue;
+                }
+
                 if self.ledger.is_writer_done() {
                     return Ok(None);
                 }
@@ -1091,9 +1117,29 @@ where
                 if reader_file_id == writer_file_id {
                     // We're currently just seeking to where we left off the last time this buffer was
                     // running, which might mean there's no records for us to read at all because we
-                    // were already caught up.  All we can do is signal to `seek_to_next_record` that
-                    // we're caught up.
-                    return Ok(None);
+                    // were already caught up.
+                    //
+                    // However, we must NOT return None if there are still unacknowledged events in
+                    // the buffer. With batched sinks, returning None terminates the sink before
+                    // incomplete batches are flushed, leaving events unacknowledged and stuck in
+                    // the buffer.
+                    //
+                    // Only return None if the buffer is truly empty (all events acknowledged).
+                    let total_buffer_size = self.ledger.get_total_buffer_size();
+                    if total_buffer_size == 0 {
+                        return Ok(None);
+                    }
+
+                    // There are still unacknowledged events. Wait for acknowledgments to arrive
+                    // before signaling end of stream.
+                    debug!(
+                        total_buffer_size,
+                        "Waiting for acknowledgements before signaling end of stream."
+                    );
+                    self.handle_pending_acknowledgements(false)
+                        .await
+                        .context(IoSnafu)?;
+                    continue;
                 }
             }
         };
