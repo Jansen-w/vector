@@ -1091,7 +1091,7 @@ where
                     writer_file_id,
                     "Disk buffer reader: checking buffer state (ready_to_read=true)"
                 );
-                
+
                 if total_buffer_size > 0 {
                     // There are unacknowledged events. Use a timeout when waiting for the writer
                     // to avoid blocking forever. This allows the sink's batch timeout to fire.
@@ -1131,8 +1131,12 @@ where
                     return Ok(None);
                 }
 
-                info!("Disk buffer reader: waiting for writer (buffer empty, writer not done)");
-                self.ledger.wait_for_writer().await;
+                // Even when buffer appears empty, use a timeout to allow batch timeouts to fire.
+                // The sink may have events in its batch that need to be flushed.
+                info!("Disk buffer reader: waiting for writer with timeout (buffer empty, writer not done)");
+                use tokio::time::{Duration, timeout};
+                let _ = timeout(Duration::from_secs(1), self.ledger.wait_for_writer()).await;
+                continue;
             } else {
                 debug!(
                     bytes_read = self.bytes_read,
