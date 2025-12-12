@@ -1077,6 +1077,10 @@ where
                     continue;
                 }
 
+                if self.ledger.is_writer_done() {
+                    return Ok(None);
+                }
+
                 self.ledger.wait_for_writer().await;
             } else {
                 debug!(
