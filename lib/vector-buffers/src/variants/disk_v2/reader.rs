@@ -1083,10 +1083,23 @@ where
                 // deadlock. Processing acknowledgements may free up buffer space and allow
                 // the batch timeout to fire.
                 let total_buffer_size = self.ledger.get_total_buffer_size();
+                let is_writer_done = self.ledger.is_writer_done();
+                info!(
+                    total_buffer_size,
+                    is_writer_done,
+                    reader_file_id,
+                    writer_file_id,
+                    "Disk buffer reader: checking buffer state (ready_to_read=true)"
+                );
+                
                 if total_buffer_size > 0 {
                     // There are unacknowledged events. Use a timeout when waiting for the writer
                     // to avoid blocking forever. This allows the sink's batch timeout to fire.
                     use tokio::time::{Duration, timeout};
+                    info!(
+                        total_buffer_size,
+                        "Disk buffer reader: unacked events exist, using timeout wait"
+                    );
                     let wait_result = timeout(
                         Duration::from_secs(1),
                         self.ledger.wait_for_writer()
@@ -1096,17 +1109,29 @@ where
                         // Timeout - no new data from writer. Process any pending acks
                         // and continue the loop. This gives batched sinks a chance to
                         // flush incomplete batches via their timeout mechanism.
+                        info!(
+                            total_buffer_size,
+                            "Disk buffer reader: timeout waiting for writer, processing acks"
+                        );
                         self.handle_pending_acknowledgements(false)
                             .await
                             .context(IoSnafu)?;
+                        let new_buffer_size = self.ledger.get_total_buffer_size();
+                        info!(
+                            old_buffer_size = total_buffer_size,
+                            new_buffer_size,
+                            "Disk buffer reader: after processing acks"
+                        );
                     }
                     continue;
                 }
 
-                if self.ledger.is_writer_done() {
+                if is_writer_done {
+                    info!("Disk buffer reader: writer done and buffer empty, returning None");
                     return Ok(None);
                 }
 
+                info!("Disk buffer reader: waiting for writer (buffer empty, writer not done)");
                 self.ledger.wait_for_writer().await;
             } else {
                 debug!(
@@ -1126,19 +1151,32 @@ where
                     //
                     // Only return None if the buffer is truly empty (all events acknowledged).
                     let total_buffer_size = self.ledger.get_total_buffer_size();
+                    info!(
+                        total_buffer_size,
+                        reader_file_id,
+                        writer_file_id,
+                        "Disk buffer reader: init path, checking buffer state (ready_to_read=false)"
+                    );
                     if total_buffer_size == 0 {
+                        info!("Disk buffer reader: init path, buffer empty, returning None");
                         return Ok(None);
                     }
 
                     // There are still unacknowledged events. Wait for acknowledgments to arrive
                     // before signaling end of stream.
-                    debug!(
+                    info!(
                         total_buffer_size,
-                        "Waiting for acknowledgements before signaling end of stream."
+                        "Disk buffer reader: init path, waiting for acks before signaling end of stream"
                     );
                     self.handle_pending_acknowledgements(false)
                         .await
                         .context(IoSnafu)?;
+                    let new_buffer_size = self.ledger.get_total_buffer_size();
+                    info!(
+                        old_buffer_size = total_buffer_size,
+                        new_buffer_size,
+                        "Disk buffer reader: init path, after processing acks"
+                    );
                     continue;
                 }
             }
